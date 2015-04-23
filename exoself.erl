@@ -5,11 +5,11 @@
 map() ->
 	map(ffnn).
 map(FileName) ->
-	{ok,Genotype} = file:consult(FileName),
+	Genotype = genotype:load_from_file(FileName),
 	spawn(exoself,map,[FileName,Genotype]).
 map(FileName,Genotype) ->
 	IdsNPIds = ets:new(idsNpids,[set,private]),
-	[Cx|CerebralUnits] = Genotype,
+	Cx = genotype:read(Genotype,cortex),
 	Sensor_Ids = Cx#cortex.sensor_ids,
 	Actuator_Ids = Cx#cortex.actuator_ids,
 	NIds = Cx#cortex.nids,
@@ -17,17 +17,12 @@ map(FileName,Genotype) ->
 	spawn_CerebralUnits(IdsNPIds,sensor,Sensor_Ids),
 	spawn_CerebralUnits(IdsNPIds,actuator,Actuator_Ids),
 	spawn_CerebralUnits(IdsNPIds,neuron,NIds),
-	link_CerebralUnits(CerebralUnits,IdsNPIds),
+	link_Sensors(Genotype,Sensor_Ids,IdsNPIds),
+	link_Actuators(Genotype,Actuator_Ids,IdsNPIds),
+	link_Neurons(Genotype,NIds,IdsNPIds),
 	link_Cortex(Cx,IdsNPIds),
 	Cx_PId = ets:lookup_element(IdsNPIds,Cx#cortex.id,2),
-	receive
-		{Cx_PId,backup,Neuron_IdsNWeights} ->
-			U_Genotype = update_Genotype(IdsNPIds,Genotype,Neuron_IdsNWeights),
-			{ok,File} = file:open(FileName,write),
-			lists:foreach(fun(X) -> io:format(File,"~p.~n",[X]) end, U_Genotype),
-			file:close(File),
-			io:format("Finished updating to file:~p~n",[FileName])
-	end.
+	genotype:save_to_file(FileName,Genotype).
 %The map/1 function maps the tuple encoded genotype into a process based phenotype. The map function expects for the Cx record to be the leading tuple in the tuple list it reads from the FileName. We create an ets table to map Ids to PIds and back again. Since the Cortex element contains all the Sensor, Actuator and Neuron Ids, we are able to spawn each neuron using its own gen function, and in the process construct a map from Ids to PIds. We then use the link_CerebralUnits to link all non Cortex elements to each other by sending each spawned process the information contained in its record, but with Ids converted to PIds where appropriate. Finally, we provide the Cortex process with all the PIds in the NN system by executing the link_Cortex/2 function. Once the NN is up and running, exoself starts its wait until the NN has finished its job and is ready to backup. When the cortex initiates the backup process it sends exoself the updated Input_PIdPs from its neurons. Exoself uses the update_genotype/3 function to update the old genotype with new weights, and then stores the updated version back to its file.
 
 	spawn_CerebralUnits(IdsNPIds,CerebralUnitType,[Id|Ids]) ->
@@ -39,26 +34,32 @@ map(FileName,Genotype) ->
 		true.
 %We spawn the process for each element based on its type: CerebralUnitType, and the gen function that belongs to the CerebralUnitType module. We then enter the {Id,PId} tuple into our ETS table for later use.
 
-	link_CerebralUnits([R|Records],IdsNPIds) when is_record(R,sensor) ->
-		SId = R#sensor.id,
+	link_Sensors(Genotype,[SId|Sensor_Ids],IdsNPIds) ->
+		R = genotype:read(Genotype,SId),
 		SPId = ets:lookup_element(IdsNPIds,SId,2),
 		Cx_PId = ets:lookup_element(IdsNPIds,R#sensor.cx_id,2),
 		SName = R#sensor.name,
 		Fanout_Ids = R#sensor.fanout_ids,
 		Fanout_PIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- Fanout_Ids],
 		SPId ! {self(), {SId,Cx_PId,SName,R#sensor.vl,Fanout_PIds}},
-		link_CerebralUnits(Records,IdsNPIds);
-	link_CerebralUnits([R|Records],IdsNPIds) when is_record(R,actuator) ->
-		AId = R#actuator.id,
+		link_Sensors(Genotype,Sensor_Ids,IdsNPIds);
+	link_Sensors(_Genotype,[],_IdsNPIds) ->
+		ok.
+
+	link_Actuators(Genotype,[AId|Actuator_Ids],IdsNPIds) ->
+		R = genotype:read(Genotype,AId),
 		APId = ets:lookup_element(IdsNPIds,AId,2),
 		Cx_PId = ets:lookup_element(IdsNPIds,R#actuator.cx_id,2),
 		AName = R#actuator.name,
 		Fanin_Ids = R#actuator.fanin_ids,
 		Fanin_PIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- Fanin_Ids],
 		APId ! {self(),{AId,Cx_PId,AName,Fanin_PIds}},
-		link_CerebralUnits(Records,IdsNPIds);
-	link_CerebralUnits([R|Records],IdsNPIds) when is_record(R,neuron) ->
-		NId = R#neuron.id,
+		link_Actuators(Genotype,Actuator_Ids,IdsNPIds);
+	link_Actuators(_Genotype,[],_IdsNPIds) ->
+		ok.
+
+	link_Neurons(Genotype,[NId|Neuron_Ids],IdsNPIds) ->
+		R = genotype:read(Genotype,NId),
 		NPId = ets:lookup_element(IdsNPIds,NId,2),
 		Cx_PId = ets:lookup_element(IdsNPIds,R#neuron.cx_id,2),
 		AFName = R#neuron.af,
@@ -67,8 +68,8 @@ map(FileName,Genotype) ->
 		Input_PIdPs = convert_IdPs2PIdPs(IdsNPIds,Input_IdPs,[]),
 		Output_PIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- Output_Ids],
 		NPId ! {self(),{NId,Cx_PId,AFName,Input_PIdPs,Output_PIds}},
-		link_CerebralUnits(Records,IdsNPIds);
-	link_CerebralUnits([],_IdsNPIds) ->
+		link_Neurons(Genotype,Neuron_Ids,IdsNPIds);
+	link_Neurons(_Genotype,[],_IdsNPIds) ->
 		ok.
 
 	convert_IdPs2PIdPs(_IdsNPIds,[{bias,Bias}],Acc) ->
@@ -86,15 +87,31 @@ map(FileName,Genotype) ->
 		SPIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- SIds],
 		APIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- AIds],
 		NPIds = [ets:lookup_element(IdsNPIds,Id,2) || Id <- NIds],
-		Cx_PId ! {self(),{Cx_Id,SPIds,APIds,NPIds},1000}.
+		Cx_PId ! {self(),{Cx_Id,SPIds,APIds,NPIds},1000},
+		{SPIds,NPIds,APIds}.
 %The cortex is initialized to its proper state just as other elements. Because we have not yet implemented a learning algorithm for our NN system, we need to specify when the NN should shutdown. We do this by specifying the total number of cycles the NN should execute before terminating, which is 1000 in this case.
 
+backup_genotype(FileName,IdsNPIds,Genotype,NPIds)->
+	Neuron_IdsNWeights = get_backup(NPIds,[]),
+	update_Genotype(IdsNPIds,Genotype,Neuron_IdsNWeights),
+	genotype:save_to_file(Genotype,FileName),
+	io:format("Finished updating genotype to file:~p~n",[FileName]).
+	get_backup([NPId|NPIds],Acc)->
+		NPId ! {self(),get_backup},
+			receive
+				{NPId,NId,WeightTuples}->
+					get_backup(NPIds,[{NId,WeightTuples}|Acc])
+			end;
+	get_backup([],Acc)->
+		Acc.
+%The backup_genotype/4 uses get_backup/2 to contact all the neurons in its NN and request for the neuron's Ids and their Input_IdPs. Once the updated Input_IdPs from all the neurons have been accumulated, they are passed through the update_genotype/3 function to produce the genotype with updated weights, which is then saved to file.
+
 	update_Genotype(IdsNPIds,Genotype,[{N_Id,PIdPs}|WeightPs]) ->
-		N = lists:keyfind(N_Id,2,Genotype),
+		N = genotype:read(Genotype,N_Id),
 		io:format("PIdPs:~p~n",[PIdPs]),
 		Updated_InputIdPs = convert_PIdPs2IdPs(IdsNPIds,PIdPs,[]),
 		U_N = N#neuron{input_idps=Updated_InputIdPs},
-		U_Genotype = lists:keyreplace(N_Id,2,Genotype,U_N),
+		U_Genotype = genotype:write(Genotype,U_N),
 		io:format("N:~p~n U_N:~p~n Genotype:~p~n U_Genotype:~p~n",[N,U_N,Genotype,U_Genotype]),
 		update_Genotype(IdsNPIds,Genotype,WeightPs);
 	update_Genotype(_IdsNPIds,Genotype,[]) ->
